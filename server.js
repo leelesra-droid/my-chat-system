@@ -1,7 +1,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const sqlite3 = require("sqlite3").verbose();
+const Database = require("better-sqlite3");
 const bcrypt = require("bcrypt");
 const session = require("express-session");
 const cors = require("cors");
@@ -12,11 +12,13 @@ const jwt = require("jsonwebtoken");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
+/* ================= APP INIT ================= */
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const db = new sqlite3.Database("./messages.db");
+const db = new Database("./messages.db");
 const clients = new Map();
 
 /* ================= SECURITY ================= */
@@ -31,293 +33,293 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-/* Login rate limiter */
+/* ================= RATE LIMIT ================= */
 
-const loginLimiter = rateLimit({
+app.use("/login", rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15
-});
-
-app.use("/login", loginLimiter);
+}));
 
 /* ================= SESSION ================= */
 
-app.use(
-  session({
-    secret: "chat_secure_secret_super_random",
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: false
-    }
-  })
-);
+app.use(session({
+  secret: "chat_secure_super_random",
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "lax"
+  }
+}));
+
+/* ================= STATIC FILES ================= */
 
 app.use(express.static(path.join(__dirname, "public")));
 
-/* ================= DATABASE ================= */
+/* ================= DATABASE TABLES ================= */
 
-db.serialize(() => {
+db.exec(`
+CREATE TABLE IF NOT EXISTS users(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+username TEXT UNIQUE,
+password TEXT,
+role TEXT DEFAULT 'user'
+);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE,
-      password TEXT,
-      role TEXT DEFAULT 'user'
-    )
-  `);
+CREATE TABLE IF NOT EXISTS messages(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+sender TEXT,
+recipient TEXT,
+content TEXT,
+is_read INTEGER DEFAULT 0,
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS messages(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sender TEXT,
-      recipient TEXT,
-      content TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+/* Default admin */
 
-  /* Default admin */
+const adminExists = db.prepare(
+"SELECT * FROM users WHERE username=?"
+).get("admin");
 
-  bcrypt.hash("0-admini-1", 10).then(hash => {
+if (!adminExists) {
 
-    db.get(
-      "SELECT * FROM users WHERE username='admin'",
-      (err, row) => {
+const hash = bcrypt.hashSync("0-admini-1", 10);
 
-        if (!row) {
-          db.run(
-            "INSERT INTO users(username,password,role) VALUES(?,?,?)",
-            ["admin", hash, "admin"]
-          );
-        }
+db.prepare(
+"INSERT INTO users(username,password,role) VALUES(?,?,?)"
+).run("admin", hash, "admin");
 
-      }
-    );
-
-  });
-
-});
+}
 
 /* ================= HELPERS ================= */
 
 function sanitizeText(text) {
-  return String(text).substring(0, 1000);
+return String(text).substring(0, 1000);
 }
 
-function requireLogin(req, res, next) {
-  if (!req.session.user) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
+function requireLogin(req,res,next){
+if(!req.session.user)
+return res.status(401).json({error:"Unauthorized"});
+next();
 }
 
-function requireAdmin(req, res, next) {
-  if (!req.session.user || req.session.user.role !== "admin") {
-    return res.status(403).json({ error: "Admin only" });
-  }
-  next();
+function requireAdmin(req,res,next){
+if(!req.session.user || req.session.user.role!=="admin")
+return res.status(403).json({error:"Admin only"});
+next();
 }
 
 /* ================= JWT ================= */
 
-function createToken(user) {
+function createToken(user){
 
-  return jwt.sign(
-    {
-      username: user.username,
-      role: user.role
-    },
-    process.env.JWT_SECRET || "chat_secret",
-    { expiresIn: "24h" }
-  );
+return jwt.sign(
+{
+username:user.username,
+role:user.role
+},
+process.env.JWT_SECRET || "chat_secret",
+{expiresIn:"24h"}
+);
 
 }
 
-function verifyToken(token) {
+function verifyToken(token){
 
-  try {
-    return jwt.verify(
-      token,
-      process.env.JWT_SECRET || "chat_secret"
-    );
-  } catch {
-    return null;
-  }
+try{
+return jwt.verify(
+token,
+process.env.JWT_SECRET || "chat_secret"
+);
+}catch{
+return null;
+}
 
 }
 
 /* ================= WEBSOCKET ================= */
 
-wss.on("connection", (ws) => {
+wss.on("connection",(ws)=>{
 
-  let username = null;
+let username=null;
 
-  ws.on("message", (data) => {
+ws.on("message",(data)=>{
 
-    if (Buffer.byteLength(data) > 5000) return;
+if(Buffer.byteLength(data)>5000) return;
 
-    try {
+try{
 
-      const msg = JSON.parse(data);
+const msg=JSON.parse(data);
 
-      if (msg.type === "auth") {
+/* AUTH */
 
-        const decoded = verifyToken(msg.token);
+if(msg.type==="auth"){
 
-        if (!decoded) return;
+const decoded=verifyToken(msg.token);
+if(!decoded) return;
 
-        username = decoded.username;
-        clients.set(username, ws);
+username=decoded.username;
+clients.set(username,ws);
 
-        return;
-      }
+return;
+}
 
-      if (msg.type === "chat") {
+/* CHAT */
 
-        if (!username) return;
+if(msg.type==="chat"){
 
-        const content = sanitizeText(msg.content);
+if(!username) return;
 
-        db.run(
-          "INSERT INTO messages(sender,recipient,content) VALUES(?,?,?)",
-          [username, msg.recipient, content]
-        );
+const content=sanitizeText(msg.content);
 
-        const target = clients.get(msg.recipient);
+db.prepare(`
+INSERT INTO messages(sender,recipient,content,is_read)
+VALUES(?,?,?,0)
+`).run(username,msg.recipient,content);
 
-        if (target && target.readyState === WebSocket.OPEN) {
+const target=clients.get(msg.recipient);
 
-          target.send(JSON.stringify({
-            type: "new_message",
-            sender: username,
-            content
-          }));
+if(target && target.readyState===WebSocket.OPEN){
 
-        }
+target.send(JSON.stringify({
+type:"new_message",
+sender:username,
+content
+}));
 
-      }
+}
 
-    } catch (e) {
-      console.log(e);
-    }
+}
 
-  });
+}catch(e){
+console.log(e);
+}
 
-  ws.on("close", () => {
-    if (username) clients.delete(username);
-  });
+});
+
+ws.on("close",()=>{
+if(username) clients.delete(username);
+});
 
 });
 
 /* ================= REGISTER ================= */
 
-app.post("/register", async (req, res) => {
+app.post("/register",async(req,res)=>{
 
-  const { username, password } = req.body || {};
+const {username,password}=req.body||{};
 
-  if (!username || !password) {
-    return res.status(400).json({ error: "Missing fields" });
-  }
+if(!username || !password)
+return res.status(400).json({error:"Missing fields"});
 
-  const hash = await bcrypt.hash(password, 10);
+const hash=await bcrypt.hash(password,10);
 
-  db.run(
-    "INSERT INTO users(username,password) VALUES(?,?)",
-    [username, hash],
-    (err) => {
+try{
 
-      if (err) return res.json({ error: "Username exists" });
+db.prepare(`
+INSERT INTO users(username,password)
+VALUES(?,?)
+`).run(username,hash);
 
-      res.json({ success: true });
+res.json({success:true});
 
-    }
-  );
+}catch{
+res.json({error:"Username exists"});
+}
 
 });
 
 /* ================= LOGIN ================= */
 
-app.post("/login", (req, res) => {
+app.post("/login",(req,res)=>{
 
-  const { username, password } = req.body || {};
+const {username,password}=req.body||{};
 
-  db.get(
-    "SELECT * FROM users WHERE username=?",
-    [username],
-    async (err, user) => {
+const user=db.prepare(`
+SELECT * FROM users WHERE username=?
+`).get(username);
 
-      if (!user)
-        return res.status(400).json({ error: "User not found" });
+if(!user)
+return res.status(400).json({error:"User not found"});
 
-      const match = await bcrypt.compare(password, user.password);
+const match=bcrypt.compareSync(password,user.password);
 
-      if (!match)
-        return res.status(401).json({ error: "Wrong password" });
+if(!match)
+return res.status(401).json({error:"Wrong password"});
 
-      req.session.user = {
-        username: user.username,
-        role: user.role
-      };
+req.session.user={
+username:user.username,
+role:user.role
+};
 
-      req.session.save();
+req.session.save();
 
-      res.json({
-        success: true,
-        role: user.role,
-        token: createToken(user)
-      });
+res.json({
+success:true,
+role:user.role,
+token:createToken(user)
+});
 
-    }
-  );
+});
+
+/* ================= AUTO DELETE VIEWED MESSAGES ================= */
+
+app.post("/mark-read",requireLogin,(req,res)=>{
+
+const username=req.session.user.username;
+
+db.prepare(`
+DELETE FROM messages
+WHERE recipient=? AND is_read=1
+`).run(username);
+
+res.json({success:true});
 
 });
 
 /* ================= INBOX ================= */
 
-app.get("/inbox", requireLogin, (req, res) => {
+app.get("/inbox",requireLogin,(req,res)=>{
 
-  const username = req.session.user.username;
+const username=req.session.user.username;
 
-  db.all(
-    "SELECT * FROM messages WHERE recipient=?",
-    [username],
-    (err, rows) => {
-      res.json(rows || []);
-    }
-  );
+const rows=db.prepare(`
+SELECT * FROM messages
+WHERE recipient=?
+`).all(username);
+
+res.json(rows||[]);
 
 });
 
 /* ================= ADMIN ================= */
 
-app.get("/admin/users", requireAdmin, (req, res) => {
+app.get("/admin/users",requireAdmin,(req,res)=>{
 
-  db.all(
-    "SELECT id,username,role FROM users",
-    (err, rows) => {
-      res.json(rows || []);
-    }
-  );
+const rows=db.prepare(`
+SELECT id,username,role FROM users
+`).all();
 
-});
-
-app.get("/admin/messages", requireAdmin, (req, res) => {
-
-  db.all(
-    "SELECT * FROM messages ORDER BY created_at DESC",
-    (err, rows) => {
-      res.json(rows || []);
-    }
-  );
+res.json(rows||[]);
 
 });
 
-/* ================= START SERVER ================= */
+app.get("/admin/messages",requireAdmin,(req,res)=>{
 
-server.listen(3000, () => {
-  console.log("🔥 ULTRA SECURE CHAT RUNNING http://localhost:3000");
+const rows=db.prepare(`
+SELECT * FROM messages
+ORDER BY created_at DESC
+`).all();
+
+res.json(rows||[]);
+
+});
+
+/* ================= SERVER START ================= */
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT,()=>{
+console.log("🔥 ULTRA SECURE CHAT RUNNING");
 });
